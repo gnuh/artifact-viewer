@@ -3,10 +3,10 @@ import type { EngineInterface, ImageSource, Register } from 'claude-code'
 
 import type { Item, Kind } from '../types'
 
-// ponytail: macOS + Google Chrome + node on PATH; another OS needs its own CHROME and cell probe.
 const PANE = 'artifacts'
-const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+const TITLE = 'Artifact Viewer'
 const SCALE = 2
+const NODE_MAJOR = 22 // the helper needs the global WebSocket, stable from Node 22
 const KINDS: Record<string, Kind> = {
   html: 'page', htm: 'page', svg: 'page', pdf: 'page', png: 'page', jpg: 'page', jpeg: 'page', gif: 'page', webp: 'page',
   md: 'md', markdown: 'md', mmd: 'mermaid', mermaid: 'mermaid',
@@ -20,42 +20,51 @@ const items = atom({ plugin: 'artifact-viewer', key: 'items' } as const, [])
 const current = atom({ plugin: 'artifact-viewer', key: 'current' } as const, '')
 
 type Mode = 'asked' | 'write' | 'edit'
-type Helper = { socket: string; runDir: string; ready: Promise<void> }
+type Helper = { url: string; token: string; runDir: string; ready: Promise<void> }
+type Host = { isWindows: boolean; home: string; cache: string }
 
 // The module's own run state: a reload starts a fresh helper, so none of it needs to survive one.
+let host: Host = { isWindows: false, home: '', cache: '' }
 let helper: Helper | undefined
+let view: 'pane' | 'window' = 'pane'
 let frame: ImageSource | undefined
 let shown = ''
-let cell = { width: 17, height: 34 }
+let cell = { width: 18, height: 40 }
 let page = { columns: 0, rows: 0, width: 1, height: 1 }
 
-const fileUrl = (path: string) => `file://${encodeURI(path)}`
+const slashes = (path: string) => path.replaceAll('\\', '/')
+const fileUrl = (path: string) => `file://${/^[A-Za-z]:/.test(path) ? '/' : ''}${encodeURI(path)}`
 const escapeHtml = (text: string) => text.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c] ?? c)
+const artifactsDir = () => `${host.home}/claude-artifacts`
 
-async function home($: EngineInterface) {
-  return (await $.env.get('HOME')) ?? ''
+async function detectHost($: EngineInterface): Promise<Host> {
+  const isWindows = (await $.env.get('OS')) === 'Windows_NT'
+  const home = slashes((isWindows ? await $.env.get('USERPROFILE') : await $.env.get('HOME')) ?? '')
+  const cacheRoot = isWindows
+    ? ((await $.env.get('LOCALAPPDATA')) ?? `${home}/AppData/Local`)
+    : ((await $.env.get('XDG_CACHE_HOME')) ?? `${home}/.cache`)
+
+  return { isWindows, home, cache: `${slashes(cacheRoot)}/artifact-viewer` }
 }
 
-async function artifactsDir($: EngineInterface) {
-  return `${await home($)}/claude-artifacts`
-}
+// Pictures in a pane need the terminal Claude Code draws them on (Ghostty, kitty); the rest get a window.
+async function canDrawPictures($: EngineInterface) {
+  if (await $.env.get('CLAUDE_CODE_FORCE_TERMINAL_IMAGES')) {
+    return true
+  }
+  if ((await $.env.get('TMUX')) || (await $.env.get('STY'))) {
+    return false
+  }
+  const term = (await $.env.get('TERM')) ?? ''
 
-async function call($: EngineInterface, op: string, body: object) {
-  if (!helper) {
-    throw new Error('the page renderer is not running')
-  }
-  await helper.ready
-  const response = await $.http.fetch(`http://helper/${op}`, {
-    method: 'POST',
-    body: JSON.stringify(body),
-    socketPath: helper.socket,
-  })
-  if (!response.ok) {
-    throw new Error(`renderer ${op}: ${response.text}`)
-  }
+  return (await $.env.get('TERM_PROGRAM')) === 'ghostty' || term === 'xterm-ghostty' || term.includes('kitty') ||
+    Boolean(await $.env.get('KITTY_WINDOW_ID'))
 }
 
 async function measureCells($: EngineInterface) {
+  if (host.isWindows) {
+    return
+  }
   const probe = await $.process.run(['python3', '-c', CELL_PROBE]).catch(() => undefined)
   const [width = 0, height = 0] = probe?.stdout.trim().split(' ').map(Number) ?? []
   if (width > 0 && height > 0) {
@@ -63,13 +72,91 @@ async function measureCells($: EngineInterface) {
   }
 }
 
-// Runs the headless page renderer for the session's life and blits each frame it paints.
+async function mustRun($: EngineInterface, argv: string[]) {
+  const ran = await $.process.run(argv, { timeoutMs: 600_000 })
+  if (ran.exitCode !== 0) {
+    throw new Error(`${argv[0]} failed: ${ran.stderr.trim().slice(0, 300)}`)
+  }
+
+  return ran.stdout.trim()
+}
+
+// Node on the PATH when it is new enough, else a copy downloaded once into the cache.
+async function nodeBinary($: EngineInterface) {
+  const installed = await $.process.run(['node', '--version']).catch(() => undefined)
+  if (installed?.exitCode === 0 && Number(installed.stdout.trim().slice(1).split('.')[0]) >= NODE_MAJOR) {
+    return 'node'
+  }
+
+  const root = `${host.cache}/node`
+  const binaryIn = (folder: string) => (host.isWindows ? `${root}/${folder}/node.exe` : `${root}/${folder}/bin/node`)
+  for (const entry of await $.fs.list(root).catch(() => [])) {
+    if (entry.kind === 'dir' && (await $.fs.exists(binaryIn(entry.name)))) {
+      return binaryIn(entry.name)
+    }
+  }
+
+  const os = host.isWindows ? 'win' : (await mustRun($, ['uname', '-s'])) === 'Darwin' ? 'darwin' : 'linux'
+  const machine = host.isWindows ? ((await $.env.get('PROCESSOR_ARCHITECTURE')) ?? '') : await mustRun($, ['uname', '-m'])
+  const arch = /arm64|aarch64/i.test(machine) ? 'arm64' : 'x64'
+  const releases = JSON.parse((await $.http.fetch('https://nodejs.org/dist/index.json')).text) as { version: string; lts: unknown }[]
+  const version = releases.find(release => release.lts && Number(release.version.slice(1).split('.')[0]) >= NODE_MAJOR)?.version
+  if (!version) {
+    throw new Error('no Node.js LTS release found')
+  }
+  const name = `node-${version}-${os}-${arch}`
+  const archive = `${root}/${name}.${host.isWindows ? 'zip' : 'tar.gz'}`
+  $.ui.toast('artifact-viewer: downloading Node.js (about 30 MB, only this once)…')
+  await $.fs.write(`${root}/.keep`, '')
+  await mustRun($, ['curl', '-fsSL', '-o', archive, `https://nodejs.org/dist/${version}/${name}.${host.isWindows ? 'zip' : 'tar.gz'}`])
+  // ponytail: the archive stays beside the unpacked copy; delete it when cache size matters.
+  await mustRun($, ['tar', '-xf', archive, '-C', root])
+
+  return binaryIn(name)
+}
+
+async function call($: EngineInterface, op: string, body: object) {
+  if (!helper) {
+    throw new Error('the page renderer is not running')
+  }
+  await helper.ready
+  const response = await $.http.fetch(`${helper.url}/${op}`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: { 'x-token': helper.token },
+  })
+  if (!response.ok) {
+    throw new Error(`renderer ${op}: ${response.text}`)
+  }
+}
+
+async function useWindow($: EngineInterface) {
+  view = 'window'
+  $.ui.invalidate('ui.render')
+  await call($, 'mode', { mode: 'window' })
+}
+
+async function showFrame($: EngineInterface, file: string, generation: number) {
+  if (view !== 'pane') {
+    return
+  }
+  frame = { file, format: 'png', generation }
+  const blitted = await $.ui.blit({ requestId: PANE, key: 'view', source: frame })
+  if (blitted.deny !== undefined && /draws its alt/.test(blitted.deny)) {
+    await useWindow($)
+  } else if (blitted.deny !== undefined) {
+    $.ui.invalidate('ui.render')
+  }
+}
+
+// Runs the page renderer for the session's life and blits each frame it paints.
 async function runHelper($: EngineInterface) {
-  const runDir = `${await artifactsDir($)}/.viewer/${crypto.randomUUID().slice(0, 8)}`
+  const runDir = `${artifactsDir()}/.viewer/${crypto.randomUUID().slice(0, 8)}`
   let markReady = () => {}
-  const mine: Helper = { socket: `${runDir}/b.sock`, runDir, ready: new Promise(resolve => (markReady = resolve)) }
+  const mine: Helper = { url: '', token: '', runDir, ready: new Promise(resolve => (markReady = resolve)) }
   helper = mine
-  const child = $.process.spawn({ argv: ['node', `${$.plugin.root}/bin/browser.mjs`, mine.socket, runDir, CHROME] })
+  const node = await nodeBinary($)
+  const child = $.process.spawn({ argv: [node, `${$.plugin.root}/bin/browser.mjs`, runDir, host.cache, view] })
   let pending = ''
   for await (const { stream, text } of child) {
     if (stream === 'stderr') {
@@ -80,15 +167,15 @@ async function runHelper($: EngineInterface) {
     const lines = pending.split('\n')
     pending = lines.pop() ?? ''
     for (const line of lines) {
-      const found = line.match(/^frame (.+) (\d+)$/)
-      if (line === 'ready') {
+      const [word = '', ...rest] = line.trim().split(' ')
+      if (word === 'ready') {
+        mine.url = `http://127.0.0.1:${rest[0]}`
+        mine.token = rest[1] ?? ''
         markReady()
-      } else if (found) {
-        frame = { file: found[1] ?? '', format: 'png', generation: Number(found[2]) }
-        const blitted = await $.ui.blit({ requestId: PANE, key: 'view', source: frame })
-        if (blitted.deny !== undefined) {
-          $.ui.invalidate('ui.render')
-        }
+      } else if (word === 'frame') {
+        await showFrame($, rest.slice(0, -1).join(' '), Number(rest.at(-1)))
+      } else if (word === 'status') {
+        $.ui.toast(`artifact-viewer: ${rest.join(' ')}`)
       }
     }
   }
@@ -99,7 +186,7 @@ async function runHelper($: EngineInterface) {
 
 async function present($: EngineInterface, item: Item) {
   await update($, current, () => item.path)
-  void $.ui.open({ id: PANE, title: 'Artefatos' })
+  void $.ui.open({ id: PANE, title: TITLE })
   if (item.kind === 'md' || (item.kind === 'page' && item.path === shown)) {
     return
   }
@@ -123,10 +210,15 @@ async function present($: EngineInterface, item: Item) {
   return call($, 'show', { url: fileUrl(wrapper), file: wrapper })
 }
 
+async function reopen($: EngineInterface, item: Item) {
+  shown = ''
+  await present($, item)
+}
+
 // Returns why the file was not shown, or undefined once it is in the pane.
 async function show($: EngineInterface, path: string, mode: Mode): Promise<string | undefined> {
-  const stat = await $.fs.stat(path.replace(/^~(?=\/)/, await home($)), { resolve: true })
-  const real = stat.realPath ?? path
+  const stat = await $.fs.stat(path.replace(/^~(?=[\\/])/, host.home), { resolve: true })
+  const real = slashes(stat.realPath ?? path)
   const name = real.slice(real.lastIndexOf('/') + 1)
   const kind = KINDS[name.slice(name.lastIndexOf('.') + 1).toLowerCase()]
   if (!kind) {
@@ -167,6 +259,14 @@ async function forward($: EngineInterface, op: string, body: object) {
   await call($, op, body).catch(() => {})
 }
 
+async function startSession($: EngineInterface) {
+  host = await detectHost($)
+  view = (await canDrawPictures($)) ? 'pane' : 'window'
+  await measureCells($)
+  // ponytail: one idle node per session; the browser itself starts on the first page shown.
+  void runHelper($).catch(error => $.ui.toast(`artifact-viewer: page renderer failed: ${String(error)}`))
+}
+
 export const register: Register = on => {
   on('tool.call', { tool: 'Write' }, async ($, e, next) => {
     const ran = await next(e)
@@ -193,9 +293,7 @@ export const register: Register = on => {
       description: 'Open the artifact pane, or show a file in it',
       argumentHint: '[file]',
     })
-    await measureCells($)
-    // ponytail: one idle node per session; Chrome itself starts on the first page shown.
-    void runHelper($).catch(error => $.ui.toast(`artifact-viewer: page renderer failed: ${String(error)}`))
+    await startSession($)
 
     return started
   })
@@ -204,7 +302,7 @@ export const register: Register = on => {
     const path = e.args.trim()
     try {
       if (!path) {
-        await $.ui.open({ id: PANE, title: 'Artefatos' })
+        await $.ui.open({ id: PANE, title: TITLE })
 
         return { text: 'Artifact pane open.' }
       }
@@ -247,11 +345,12 @@ export const register: Register = on => {
         </Box>
       )
     }
-    if (e.surface !== 'terminal') {
+    if (e.surface !== 'terminal' || view === 'window') {
       return (
         <Box flexDirection="column">
           {tabs}
-          <Text dimColor>{item.name}: a página só é desenhada no terminal (Ghostty ou kitty).</Text>
+          <Text dimColor>{item.name} está aberto na janela à direita: este terminal não desenha imagens no painel.</Text>
+          <Button key="reopen" label="Abrir a janela de novo" onPress={() => reopen($, item)} />
         </Box>
       )
     }
@@ -266,13 +365,7 @@ export const register: Register = on => {
       <Box flexDirection="column">
         {tabs}
         <Box width={columns} height={rows}>
-          <Image
-            key="view"
-            source={frame ?? BLANK}
-            columns={columns}
-            rows={rows}
-            alt={`${item.name}: este terminal não desenha imagens (use Ghostty ou kitty)`}
-          />
+          <Image key="view" source={frame ?? BLANK} columns={columns} rows={rows} alt={`${item.name}: carregando…`} />
           <Box position="absolute" top={0} left={0}>
             <Client key="input" module="./input.ts" width={columns} height={rows} />
           </Box>
@@ -299,7 +392,7 @@ export const register: Register = on => {
   })
 
   on('ui.scroll', async ($, e, next) => {
-    const isPageShown = shown !== '' && (await read($, current)) === shown
+    const isPageShown = view === 'pane' && shown !== '' && (await read($, current)) === shown
     if (e.component !== 'Pane' || e.requestId !== PANE || !isPageShown) {
       return next(e)
     }
@@ -319,12 +412,15 @@ export const register: Register = on => {
     if (e.surfaces.length === 0) {
       return composed
     }
+    if (!host.home) {
+      host = await detectHost($)
+    }
 
     const text = [
       '# Artifacts',
       "The user sees an artifact pane docked on the right of this Claude Code session, like the artifact panel of Claude's desktop app.",
       'Every .html, .svg, .mmd (Mermaid) or .md file you create with Write shows there by itself, rendered and interactive, and reloads whenever you Write or Edit it again.',
-      `So when the user asks for something to look at (a page, mockup, chart, diagram, report, slides, a document), deliver it as one self-contained file in ${await artifactsDir($)}/ unless they name another place (libraries may load from a CDN), and tell them it is in the pane.`,
+      `So when the user asks for something to look at (a page, mockup, chart, diagram, report, slides, a document), deliver it as one self-contained file in ${artifactsDir()}/ unless they name another place (libraries may load from a CDN), and tell them it is in the pane.`,
       'Do not open it in a browser, take screenshots of it, or paste its rendered content into the reply.',
     ].join('\n')
 
