@@ -5,7 +5,6 @@ import type { Item, Kind } from '../types'
 
 const PANE = 'artifacts'
 const TITLE = 'Artifact Viewer'
-const SCALE = 2
 const NODE_MAJOR = 22 // the helper needs the global WebSocket, stable from Node 22
 const KINDS: Record<string, Kind> = {
   html: 'page', htm: 'page', svg: 'page', pdf: 'page', png: 'page', jpg: 'page', jpeg: 'page', gif: 'page', webp: 'page',
@@ -30,6 +29,7 @@ let view: 'pane' | 'window' = 'pane'
 let frame: ImageSource | undefined
 let shown = ''
 let cell = { width: 18, height: 40 }
+let scale = 2
 let page = { columns: 0, rows: 0, width: 1, height: 1 }
 
 const slashes = (path: string) => path.replaceAll('\\', '/')
@@ -172,6 +172,10 @@ async function runHelper($: EngineInterface) {
         mine.url = `http://127.0.0.1:${rest[0]}`
         mine.token = rest[1] ?? ''
         markReady()
+        // A pane drawn before the renderer was up (a plugin reload redraws it first) asked for its size in vain.
+        if (page.columns > 0) {
+          await resize($, page.columns, page.rows)
+        }
       } else if (word === 'frame') {
         await showFrame($, rest.slice(0, -1).join(' '), Number(rest.at(-1)))
       } else if (word === 'status') {
@@ -251,8 +255,8 @@ async function capture($: EngineInterface, path: string, mode: Mode) {
 }
 
 async function resize($: EngineInterface, columns: number, rows: number) {
-  page = { columns, rows, width: Math.round((columns * cell.width) / SCALE), height: Math.round((rows * cell.height) / SCALE) }
-  await call($, 'viewport', { width: page.width, height: page.height, scale: SCALE }).catch(() => {})
+  page = { columns, rows, width: Math.round((columns * cell.width) / scale), height: Math.round((rows * cell.height) / scale) }
+  await call($, 'viewport', { width: page.width, height: page.height, scale }).catch(() => {})
 }
 
 async function forward($: EngineInterface, op: string, body: object) {
@@ -263,8 +267,14 @@ async function startSession($: EngineInterface) {
   host = await detectHost($)
   view = (await canDrawPictures($)) ? 'pane' : 'window'
   await measureCells($)
+  // ponytail: the display's density is guessed from the cell height (about 20 px on a 1x display, 40 on a 2x one):
+  // a wrong guess draws the page blurred or at half size. ARTIFACT_VIEWER_SCALE sets it; ask the display when fonts fool this.
+  scale = Number(await $.env.get('ARTIFACT_VIEWER_SCALE')) || (cell.height >= 30 ? 2 : 1)
   // ponytail: one idle node per session; the browser itself starts on the first page shown.
-  void runHelper($).catch(error => $.ui.toast(`artifact-viewer: page renderer failed: ${String(error)}`))
+  void runHelper($).catch(error => {
+    helper = undefined
+    $.ui.toast(`artifact-viewer: page renderer failed: ${String(error)}`)
+  })
 }
 
 export const register: Register = on => {
@@ -288,17 +298,16 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    await $.command.register({
-      name: 'artifacts',
-      description: 'Open the artifact pane, or show a file in it',
-      argumentHint: '[file]',
-    })
     await startSession($)
+    // Claude Code refuses a command name it ships: that must never keep the renderer from starting.
+    await $.command
+      .register({ name: 'viewer', description: 'Open the artifact pane, or show a file in it', argumentHint: '[file]' })
+      .catch(error => $.ui.toast(`artifact-viewer: ${String(error)}`))
 
     return started
   })
 
-  on('command.run', { command: 'artifacts' }, async ($, e) => {
+  on('command.run', { command: 'viewer' }, async ($, e) => {
     const path = e.args.trim()
     try {
       if (!path) {
@@ -409,11 +418,10 @@ export const register: Register = on => {
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
-    if (e.surfaces.length === 0) {
+    // Without a renderer no page reaches the pane, so the model is not told that one does.
+    // ponytail: a renderer whose browser cannot start still counts; track failed shows when that bites.
+    if (e.surfaces.length === 0 || !helper) {
       return composed
-    }
-    if (!host.home) {
-      host = await detectHost($)
     }
 
     const text = [

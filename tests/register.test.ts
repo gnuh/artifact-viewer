@@ -11,11 +11,13 @@ type World = {
   files?: Record<string, string>
   hasNode?: boolean
   blitDeny?: string
+  isCommandRefused?: boolean
+  cellPixels?: string
   // The kit resolves a path against the test's folder; a Windows host already has `C:\\...` absolute.
   isWindowsFs?: boolean
 }
 
-function world(on: On, { env = GHOSTTY, files = {}, hasNode = true, blitDeny, isWindowsFs }: World = {}) {
+function world(on: On, { env = GHOSTTY, files = {}, hasNode = true, blitDeny, isCommandRefused, cellPixels = '18 36', isWindowsFs }: World = {}) {
   const calls: { op: string; body: unknown; token?: string }[] = []
   const runs: string[][] = []
   const spawns: string[][] = []
@@ -45,7 +47,7 @@ function world(on: On, { env = GHOSTTY, files = {}, hasNode = true, blitDeny, is
   on('process.run', async ($, e) => {
     runs.push([...e.argv])
     const answers: Record<string, [number, string]> = {
-      python3: [0, '18 36\n'],
+      python3: [0, `${cellPixels}\n`],
       node: hasNode ? [0, 'v22.1.0\n'] : [127, ''],
       'uname -s': [0, 'Darwin\n'],
       'uname -m': [0, 'arm64\n'],
@@ -85,7 +87,10 @@ function world(on: On, { env = GHOSTTY, files = {}, hasNode = true, blitDeny, is
     return { value: undefined }
   })
   on('session.start', async ($, e) => ({ cwd: e.cwd }))
-  on('command.register', async ($, e) => ({ value: { command: e.name } }))
+  // Unanswered, the registration rejects, as it does for a name Claude Code ships.
+  if (!isCommandRefused) {
+    on('command.register', async ($, e) => ({ value: { command: e.name } }))
+  }
   on('tool.call', async () => ({ result: {} as never }))
 
   return { calls, runs, spawns, opened, toasts }
@@ -101,6 +106,16 @@ test('a written html file opens the pane and is rendered by the page helper', as
 
   expect(spawns[0]?.at(-1)).toBe('pane')
   expect(opened).toContain('artifacts')
+  expect(calls).toContainEqual({ op: 'show', body: { url: 'file:///p/page.html', file: '/p/page.html' }, token: 'secret' })
+})
+
+test('a command name Claude Code refuses does not keep the page helper from starting', async ($, on) => {
+  const { calls, toasts } = world(on, { isCommandRefused: true })
+  await $.session.start(START)
+
+  await $.tool.call({ tool: 'Write', file_path: '/p/page.html', content: '<h1>x</h1>' })
+
+  expect(toasts.length).toBe(1)
   expect(calls).toContainEqual({ op: 'show', body: { url: 'file:///p/page.html', file: '/p/page.html' }, token: 'secret' })
 })
 
@@ -149,6 +164,29 @@ test('a click on the picture reaches the page at the same spot', { timeoutMs: 20
   // 90x29 cells of 18x36 px at scale 2 make an 810x522 page; cell (40, 10) is centred at 40.5, 10.5.
   expect(calls).toContainEqual({ op: 'viewport', body: { width: 810, height: 522, scale: 2 }, token: 'secret' })
   expect(calls).toContainEqual({ op: 'click', body: { x: 364.5, y: 189 }, token: 'secret' })
+  await ui.unmount()
+})
+
+test('a regular display gets one page pixel per pane pixel', { timeoutMs: 20000 }, async ($, on) => {
+  const { calls } = world(on, { cellPixels: '10 21' })
+  await $.session.start(START)
+  await $.tool.call({ tool: 'Write', file_path: '/p/page.html', content: '<h1>x</h1>' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: PROPS })
+  expect(calls).toContainEqual({ op: 'viewport', body: { width: 1000, height: 609, scale: 1 }, token: 'secret' })
+  await ui.unmount()
+})
+
+test('a pane drawn before the page helper is up is sized once it is', { timeoutMs: 20000 }, async ($, on) => {
+  const { calls } = world(on)
+  await $.tool.call({ tool: 'Write', file_path: '/p/page.html', content: '<h1>x</h1>' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: PROPS })
+  expect(calls).toEqual([])
+
+  await $.session.start(START)
+  await new Promise(resolve => setTimeout(resolve, 200))
+
+  expect(calls).toContainEqual({ op: 'viewport', body: { width: 900, height: 522, scale: 2 }, token: 'secret' })
   await ui.unmount()
 })
 
@@ -204,14 +242,22 @@ test('Windows paths become file URLs and the cache sits in LOCALAPPDATA', async 
   })
 })
 
-test('the system prompt tells the model where artifacts go', async ($, on) => {
-  mock.env(on, { HOME })
-  on('prompt.compose', async () => ({ sections: [] }))
+const FACTS = { model: 'm', promptModel: 'm', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] } as const
 
-  const { sections } = await $.prompt.compose({
-    model: 'm', promptModel: 'm', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [],
-  })
+test('the system prompt tells the model where artifacts go', async ($, on) => {
+  world(on)
+  on('prompt.compose', async () => ({ sections: [] }))
+  await $.session.start(START)
+
+  const { sections } = await $.prompt.compose(FACTS)
 
   expect(sections[0]?.id).toBe('artifact-viewer:artifacts')
   expect(sections[0]?.text).toContain(`${HOME}/claude-artifacts/`)
+})
+
+test('the model is not told about the pane while no page renderer runs', async ($, on) => {
+  mock.env(on, { HOME })
+  on('prompt.compose', async () => ({ sections: [] }))
+
+  expect((await $.prompt.compose(FACTS)).sections).toEqual([])
 })
