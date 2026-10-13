@@ -1,6 +1,6 @@
 {
   "name": "artifact-viewer",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Desktop-style artifact panel for Claude Code on macOS, Linux and Windows: the HTML, SVG, Mermaid and Markdown files Claude writes render live, docked on the right",
   "author": { "name": "Magno Chiabai" },
   "repository": "https://github.com/gnuh/artifact-viewer",

@@ -2,7 +2,7 @@
 
 A Claude Code mod that brings the Claude desktop app's artifact panel into the terminal: when Claude writes an HTML, SVG, Mermaid or Markdown file, it opens docked on the right of the session, already rendered, and reloads every time the file changes. Works on macOS, Linux and Windows.
 
-- **Pages** (`.html`, `.svg`, `.mmd`, plus `.pdf` and images through `/artifacts <file>`) are rendered by Chromium. Interactive artifacts work: the mouse wheel scrolls the page, clicks reach it and typing goes to its fields.
+- **Pages** (`.html`, `.svg`, `.mmd`, plus `.pdf` and images through `/viewer <file>`) are rendered by Chromium. Interactive artifacts work: the mouse wheel scrolls the page, clicks reach it and typing goes to its fields.
 - **Markdown** (`.md`) is drawn as text inside Claude Code, the way Claude's replies are.
 - Every artifact of the session gets a tab at the top of the pane.
 - Claude is told (in its system prompt) to save visual work as a self-contained file in `~/claude-artifacts/` and to stop taking screenshots of it.
@@ -26,10 +26,12 @@ Nothing to install by hand:
 Also:
 
 - **Fullscreen layout** docks the pane beside the conversation: run `/tui fullscreen` once, or set `"tui": "fullscreen"` in `~/.claude/settings.json`.
-- The pane opens by itself when the window is at least **144 columns** wide (110 once you have opened it with `/artifacts`).
+- The pane opens by itself when the window is at least **144 columns** wide (110 once you have opened it with `/viewer`).
 - **Linux:** the downloaded Chromium needs the usual desktop libraries (`libnss3`, `libgbm1`, GTK…). Every desktop distribution has them; on a bare server install the distribution's `chromium` package, which brings them. Snap builds of Chromium cannot read the run folder and are skipped.
 
 Set `ARTIFACT_VIEWER_BROWSER` to a browser's path to use that one, or to `download` to always use Chrome for Testing.
+
+The page is drawn at the display's density, guessed from the terminal's font size. If it looks blurred or half its size, set `ARTIFACT_VIEWER_SCALE` to `1` (a regular display) or `2` (a HiDPI one).
 
 ## Install
 
@@ -47,8 +49,8 @@ Ask for something to look at ("make a dashboard of …", "draw the flow as a dia
 
 | Command | What it does |
 | --- | --- |
-| `/artifacts` | Opens the pane |
-| `/artifacts <file>` | Shows any file in it (html, svg, md, mmd, pdf, png, jpg, gif, webp) |
+| `/viewer` | Opens the pane |
+| `/viewer <file>` | Shows any file in it (html, svg, md, mmd, pdf, png, jpg, gif, webp) |
 
 Files under `~/.claude/`, `node_modules/`, `CLAUDE.md`/`AGENTS.md`/`MEMORY.md`, and edits of a Markdown file that is not in the pane yet are left out, so routine work does not keep opening it.
 
@@ -60,7 +62,7 @@ Files under `~/.claude/`, `node_modules/`, `CLAUDE.md`/`AGENTS.md`/`MEMORY.md`, 
 
 - Clicks only in the pane: no hover effects or dragging.
 - Mermaid diagrams load their renderer from a CDN, so they need internet.
-- Files Claude creates through the shell instead of `Write` do not open by themselves; use `/artifacts <file>`.
+- Files Claude creates through the shell instead of `Write` do not open by themselves; use `/viewer <file>`.
 
 ## Development
 
