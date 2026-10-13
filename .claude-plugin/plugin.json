@@ -1,0 +1,8 @@
+{
+  "name": "artifact-viewer",
+  "version": "0.2.0",
+  "description": "Desktop-style artifact pane inside Claude Code: HTML, SVG, Mermaid and Markdown files Claude writes render live, docked on the right (pixels need Ghostty or kitty)",
+  "author": { "name": "Magno Chiabai" },
+  "repository": "https://github.com/gnuh/artifact-viewer",
+  "types": "./types/index.d.ts"
+}

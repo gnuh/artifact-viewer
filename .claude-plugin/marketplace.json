@@ -1,0 +1,6 @@
+{
+  "name": "artifact-viewer",
+  "description": "Claude desktop's artifact panel inside Claude Code: live HTML, SVG, Mermaid and Markdown in a pane docked on the right",
+  "owner": { "name": "gnuh" },
+  "plugins": [{ "name": "artifact-viewer", "source": "./" }]
+}
